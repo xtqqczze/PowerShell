@@ -13,7 +13,9 @@ Set-StrictMode -Version 3.0
 $script:TestModulePathSeparator = [System.IO.Path]::PathSeparator
 $script:Options = $null
 
-$dotnetCLIChannel = $(Get-Content $PSScriptRoot/DotnetRuntimeMetadata.json | ConvertFrom-Json).Sdk.Channel
+$dotnetMetadata = Get-Content $PSScriptRoot/DotnetRuntimeMetadata.json | ConvertFrom-Json
+$dotnetCLIChannel = $dotnetMetadata.Sdk.Channel
+$dotnetCLIQuality = $dotnetMetadata.Sdk.Quality
 $dotnetCLIRequiredVersion = $(Get-Content $PSScriptRoot/global.json | ConvertFrom-Json).Sdk.Version
 
 # Track if tags have been sync'ed
@@ -31,14 +33,21 @@ function Sync-PSTags
         $AddRemoteIfMissing
     )
 
-    $PowerShellRemoteUrl = "https://github.com/PowerShell/PowerShell.git"
+    $powerShellRemoteUrls = @(
+        'https://github.com/PowerShell/PowerShell'
+        'git@github.com:PowerShell/PowerShell'
+    )
+    $defaultRemoteUrl = "$($powerShellRemoteUrls[0]).git"
+
     $upstreamRemoteDefaultName = 'upstream'
     $remotes = Start-NativeExecution {git --git-dir="$PSScriptRoot/.git" remote}
     $upstreamRemote = $null
     foreach($remote in $remotes)
     {
         $url = Start-NativeExecution {git --git-dir="$PSScriptRoot/.git" remote get-url $remote}
-        if($url -eq $PowerShellRemoteUrl)
+        if ($url.EndsWith('.git')) { $url = $url.Substring(0, $url.Length - 4) }
+
+        if($url -in $powerShellRemoteUrls)
         {
             $upstreamRemote = $remote
             break
@@ -47,12 +56,12 @@ function Sync-PSTags
 
     if(!$upstreamRemote -and $AddRemoteIfMissing.IsPresent -and $remotes -notcontains $upstreamRemoteDefaultName)
     {
-        $null = Start-NativeExecution {git --git-dir="$PSScriptRoot/.git" remote add $upstreamRemoteDefaultName $PowerShellRemoteUrl}
+        $null = Start-NativeExecution {git --git-dir="$PSScriptRoot/.git" remote add $upstreamRemoteDefaultName $defaultRemoteUrl}
         $upstreamRemote = $upstreamRemoteDefaultName
     }
     elseif(!$upstreamRemote)
     {
-        Write-Error "Please add a remote to PowerShell\PowerShell.  Example:  git remote add $upstreamRemoteDefaultName $PowerShellRemoteUrl" -ErrorAction Stop
+        Write-Error "Please add a remote to PowerShell\PowerShell.  Example:  git remote add $upstreamRemoteDefaultName $defaultRemoteUrl" -ErrorAction Stop
     }
 
     $null = Start-NativeExecution {git --git-dir="$PSScriptRoot/.git" fetch --tags --quiet $upstreamRemote}
@@ -132,6 +141,10 @@ function Get-EnvironmentInformation
     if ($environment.IsMacOS) {
         $environment += @{'UsingHomebrew' = [bool](Get-Command brew -ErrorAction ignore)}
         $environment += @{'UsingMacports' = [bool](Get-Command port -ErrorAction ignore)}
+
+        $environment += @{
+            'OSArchitecture' = if ((uname -v) -match 'ARM64') { 'arm64' } else { 'x64' }
+        }
 
         if (-not($environment.UsingHomebrew -or $environment.UsingMacports)) {
             throw "Neither Homebrew nor MacPorts is installed on this system, visit https://brew.sh/ or https://www.macports.org/ to continue"
@@ -1699,6 +1712,7 @@ function Install-Dotnet {
     param(
         [string]$Channel = $dotnetCLIChannel,
         [string]$Version = $dotnetCLIRequiredVersion,
+        [string]$Quality = $dotnetCLIQuality,
         [switch]$NoSudo,
         [string]$InstallDir,
         [string]$AzureFeed,
@@ -1742,7 +1756,12 @@ function Install-Dotnet {
                 throw "./$installScript was 0 length"
             }
 
-            $bashArgs = @("./$installScript", '-c', $Channel, '-v', $Version)
+            if ($Version) {
+                $bashArgs = @("./$installScript", '-v', $Version, '-q', $Quality)
+            }
+            elseif ($Channel) {
+                $bashArgs = @("./$installScript", '-c', $Channel, '-q', $Quality)
+            }
 
             if ($InstallDir) {
                 $bashArgs += @('-i', $InstallDir)
@@ -1761,7 +1780,7 @@ function Install-Dotnet {
         if (-not $environment.IsCoreCLR) {
             $installArgs = @{
                 Channel = $Channel
-                Version = $Version
+                Quality = $Quality
             }
 
             if ($InstallDir) {
@@ -1782,7 +1801,13 @@ function Install-Dotnet {
             $fullPSPath = Join-Path -Path $env:windir -ChildPath "System32\WindowsPowerShell\v1.0\powershell.exe"
             $fullDotnetInstallPath = Join-Path -Path $PWD.Path -ChildPath $installScript
             Start-NativeExecution {
-                $psArgs = @('-NoLogo', '-NoProfile', '-File', $fullDotnetInstallPath, '-Channel', $Channel, '-Version', $Version)
+
+                if ($Version) {
+                    $psArgs = @('-NoLogo', '-NoProfile', '-File', $fullDotnetInstallPath, '-Version', $Version, '-Quality', $Quality)
+                }
+                elseif ($Channel) {
+                    $psArgs = @('-NoLogo', '-NoProfile', '-File', $fullDotnetInstallPath, '-Channel', $Channel, '-Quality', $Quality)
+                }
 
                 if ($InstallDir) {
                     $psArgs += @('-InstallDir', $InstallDir)
