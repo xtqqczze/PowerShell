@@ -307,6 +307,9 @@ function Start-PSBuild {
         # it's useful for development, to do a quick changes in the engine
         [switch]$SMAOnly,
 
+        # Use nuget.org instead of the PowerShell specific feed
+        [switch]$UseNuGetOrg,
+
         # These runtimes must match those in project.json
         # We do not use ValidateScript since we want tab completion
         # If this parameter is not provided it will get determined automatically.
@@ -360,6 +363,12 @@ function Start-PSBuild {
         if ($Runtime -and "linux-x64", "win7-x64", "osx-x64" -notcontains $Runtime) {
             throw "Build for the minimal size is enabled only for following runtimes: 'linux-x64', 'win7-x64', 'osx-x64'"
         }
+    }
+
+    if ($UseNuGetOrg) {
+        Switch-PSNugetConfig -Source Public
+    } else {
+        Write-Verbose -Message "Using default feeds which are Microsoft, use `-UseNuGetOrg` to switch to Public feeds" -Verbose
     }
 
     function Stop-DevPowerShell {
@@ -718,6 +727,29 @@ Fix steps:
     }
 }
 
+function Switch-PSNugetConfig {
+    param(
+        [ValidateSet('Public', 'Private')]
+        [string] $Source = 'Public'
+    )
+
+    if ( $Source -eq 'Public') {
+        $dotnetSdk = [NugetPackageSource] @{Url = 'https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet9/nuget/v2'; Name = 'dotnet' }
+        $gallery = [NugetPackageSource] @{Url = 'https://www.powershellgallery.com/api/v2/'; Name = 'psgallery' }
+        $nugetorg = [NugetPackageSource] @{Url = 'https://api.nuget.org/v3/index.json'; Name = 'nuget.org' }
+
+        New-NugetConfigFile -NugetPackageSource $nugetorg, $dotnetSdk   -Destination "$PSScriptRoot/"
+        New-NugetConfigFile -NugetPackageSource $gallery                -Destination "$PSScriptRoot/src/Modules/"
+    } elseif ( $Source -eq 'Private') {
+        $powerShellPackages = [NugetPackageSource] @{Url = 'https://pkgs.dev.azure.com/powershell/PowerShell/_packaging/powershell/nuget/v3/index.json'; Name = 'powershell' }
+
+        New-NugetConfigFile -NugetPackageSource $powerShellPackages -Destination "$PSScriptRoot/"
+        New-NugetConfigFile -NugetPackageSource $powerShellPackages -Destination "$PSScriptRoot/src/Modules/"
+    } else {
+        throw "Unknown source: $Source"
+    }
+}
+
 function Test-ShouldGenerateExperimentalFeatures
 {
     param(
@@ -821,6 +853,10 @@ function Restore-PSPackage
             $RestoreArguments += "--interactive"
         }
 
+        if ($env:ENABLE_MSBUILD_BINLOGS) {
+            $RestoreArguments += '-bl'
+        }
+
         $ProjectDirs | ForEach-Object {
             $project = $_
             Write-Log -message "Run dotnet restore $project $RestoreArguments"
@@ -838,6 +874,23 @@ function Restore-PSPackage
                     $retryCount++
                     if($retryCount -ge $maxTries)
                     {
+                        if ($env:ENABLE_MSBUILD_BINLOGS) {
+                            if ( Test-Path ./msbuild.binlog ) {
+                                if (!(Test-Path $env:OB_OUTPUTDIRECTORY -PathType Container)) {
+                                    $null = New-Item -path $env:OB_OUTPUTDIRECTORY -ItemType Directory -Force -Verbose
+                                }
+
+                                $projectName = Split-Path -Leaf -Path $project
+                                $binlogFileName = "${projectName}.msbuild.binlog"
+                                if ($IsMacOS) {
+                                    $resolvedPath = (Resolve-Path -Path ./msbuild.binlog).ProviderPath
+                                    Write-Host "##vso[artifact.upload containerfolder=$binLogFileName;artifactname=$binLogFileName]$resolvedPath"
+                                } else {
+                                    Copy-Item -Path ./msbuild.binlog -Destination "$env:OB_OUTPUTDIRECTORY/${projectName}.msbuild.binlog" -Verbose
+                                }
+                            }
+                        }
+
                         throw
                     }
                     continue
@@ -1284,8 +1337,13 @@ function Start-PSPester {
         [Parameter(ParameterSetName='Wait', Mandatory=$true,
             HelpMessage='Wait for the debugger to attach to PowerShell before Pester starts.  Debug builds only!')]
         [switch]$Wait,
-        [switch]$SkipTestToolBuild
+        [switch]$SkipTestToolBuild,
+        [switch]$UseNuGetOrg
     )
+
+    if ($UseNuGetOrg) {
+        Switch-PSNugetConfig -Source Public
+    }
 
     if (-not (Get-Module -ListAvailable -Name $Pester -ErrorAction SilentlyContinue | Where-Object { $_.Version -ge "4.2" } ))
     {
@@ -3394,36 +3452,76 @@ function New-TestPackage
     [System.IO.Compression.ZipFile]::CreateFromDirectory($packageRoot, $packagePath)
 }
 
-function New-NugetConfigFile
-{
+class NugetPackageSource {
+    [string] $Url
+    [string] $Name
+}
+
+function New-NugetPackageSource {
     param(
-        [Parameter(Mandatory=$true)] [string] $NugetFeedUrl,
-        [Parameter(Mandatory=$true)] [string] $FeedName,
-        [Parameter(Mandatory=$true)] [string] $UserName,
-        [Parameter(Mandatory=$true)] [string] $ClearTextPAT,
-        [Parameter(Mandatory=$true)] [string] $Destination
+        [Parameter(Mandatory = $true)] [string]$Url,
+        [Parameter(Mandatory = $true)] [string] $Name
     )
 
-    $nugetConfigTemplate = @'
+    return [NugetPackageSource] @{Url = $Url; Name = $Name }
+}
+
+function New-NugetConfigFile {
+    param(
+        [Parameter(Mandatory = $true, ParameterSetName ='user')]
+        [Parameter(Mandatory = $true, ParameterSetName ='nouser')]
+        [NugetPackageSource[]] $NugetPackageSource,
+
+        [Parameter(Mandatory = $true)] [string] $Destination,
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'user')]
+        [string] $UserName,
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'user')]
+        [string] $ClearTextPAT
+    )
+
+    $nugetConfigHeaderTemplate = @'
 <?xml version="1.0" encoding="utf-8"?>
 <configuration>
   <packageSources>
     <clear />
+'@
+
+    $nugetPackageSourceTemplate = @'
     <add key="[FEEDNAME]" value="[FEED]" />
+'@
+    $nugetPackageSourceFooterTemplate = @'
   </packageSources>
   <disabledPackageSources>
     <clear />
   </disabledPackageSources>
+'@
+    $nugetCredentialsTemplate = @'
   <packageSourceCredentials>
     <[FEEDNAME]>
       <add key="Username" value="[USERNAME]" />
       <add key="ClearTextPassword" value="[PASSWORD]" />
     </[FEEDNAME]>
   </packageSourceCredentials>
+'@
+    $nugetConfigFooterTemplate = @'
 </configuration>
 '@
+    $content = $nugetConfigHeaderTemplate
 
-    $content = $nugetConfigTemplate.Replace('[FEED]', $NugetFeedUrl).Replace('[FEEDNAME]', $FeedName).Replace('[USERNAME]', $UserName).Replace('[PASSWORD]', $ClearTextPAT)
+    [NugetPackageSource]$source = $null
+    foreach ($source in $NugetPackageSource) {
+        $content += $nugetPackageSourceTemplate.Replace('[FEED]', $source.Url).Replace('[FEEDNAME]', $source.Name)
+    }
+
+    $content += $nugetPackageSourceFooterTemplate
+
+    if ($UserName -or $ClearTextPAT) {
+        $content += $nugetCredentialsTemplate.Replace('[USERNAME]', $UserName).Replace('[PASSWORD]', $ClearTextPAT)
+    }
+
+    $content += $nugetConfigFooterTemplate
 
     Set-Content -Path (Join-Path $Destination 'nuget.config') -Value $content -Force
 }
@@ -3540,4 +3638,24 @@ function Clear-NativeDependencies
     }
 
     $deps | ConvertTo-Json -Depth 20 | Set-Content "$PublishFolder/pwsh.deps.json" -Force
+}
+
+
+function Update-DotNetSdkVersion {
+    $globalJsonPath = "$PSScriptRoot/global.json"
+    $globalJson = get-content $globalJsonPath | convertfrom-json
+    $oldVersion = $globalJson.sdk.version
+    $versionParts = $oldVersion -split '\.'
+    $channel = $versionParts[0], $versionParts[1] -join '.'
+    Write-Verbose "channel: $channel" -Verbose
+    $azure_feed = 'https://dotnetcli.azureedge.net/dotnet'
+    $version_file_url = "$azure_feed/Sdk/$channel/latest.version"
+    $version = Invoke-RestMethod $version_file_url
+    Write-Verbose "updating from: $oldVersion to: $version" -Verbose
+    $globalJson.sdk.version = $version
+    $globalJson | convertto-json | out-file $globalJsonPath
+    $dotnetRuntimeMetaPath = "$psscriptroot\DotnetRuntimeMetadata.json"
+    $dotnetRuntimeMeta = get-content $dotnetRuntimeMetaPath | convertfrom-json
+    $dotnetRuntimeMeta.sdk.sdkImageVersion = $version
+    $dotnetRuntimeMeta | ConvertTo-Json | Out-File $dotnetRuntimeMetaPath
 }
